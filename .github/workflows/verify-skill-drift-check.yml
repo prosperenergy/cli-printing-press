@@ -61,12 +61,12 @@ jobs:
           EOF
 
             issue_title="verify-skill drift detected with printing-press-library"
-          issue_error="${RUNNER_TEMP:-/tmp}/verify-skill-drift-issue.err"
-          if existing_issue="$(gh issue list --state open --search "$issue_title in:title" --json number --jq '.[0].number // empty' 2>"$issue_error")"; then
-            if [[ -z "$existing_issue" ]]; then
-              : > "$issue_error"
-              issue_body="${RUNNER_TEMP:-/tmp}/verify-skill-drift-issue.md"
-              cat > "$issue_body" <<EOF
+            issue_error="${RUNNER_TEMP:-/tmp}/verify-skill-drift-issue.err"
+            if existing_issue="$(gh issue list --state open --search "$issue_title in:title" --json number --jq '.[0].number // empty' 2>"$issue_error")"; then
+              if [[ -z "$existing_issue" ]]; then
+                : > "$issue_error"
+                issue_body="${RUNNER_TEMP:-/tmp}/verify-skill-drift-issue.md"
+                cat > "$issue_body" <<EOF
           The canonical verify-skill script in cli-printing-press no longer matches the printing-press-library CI copy.
 
           - Printing Press canonical: \`$local_hash\`
@@ -91,12 +91,12 @@ jobs:
             else
               echo "Existing open drift issue: #$existing_issue" >> "$GITHUB_STEP_SUMMARY"
             fi
-          elif grep -qi "disabled issues" "$issue_error"; then
-            echo "Repository issues are disabled; skipping drift issue lookup." >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "Could not check for an existing drift issue automatically." >> "$GITHUB_STEP_SUMMARY"
-            cat "$issue_error" >&2
-          fi
+            elif grep -qi "disabled issues" "$issue_error"; then
+              echo "Repository issues are disabled; skipping drift issue lookup." >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "Could not check for an existing drift issue automatically." >> "$GITHUB_STEP_SUMMARY"
+              cat "$issue_error" >&2
+            fi
 
           echo "::error::verify-skill drift detected between cli-printing-press and printing-press-library"
           exit 1
