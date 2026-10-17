@@ -68,11 +68,15 @@ def read_utf8(path: Path) -> str:
 # Cobra supplies these without explicit source-level flag declarations. Other
 # generated/global flags must still be discovered in source so command-scoped
 # copy-paste examples cannot hide missing flags behind this whitelist.
-COMMON_FLAGS = {"help", "version"}
+COMMON_FLAGS = {"help", "home", "version"}
 
 CODEBLOCK_BASH = re.compile(r"^[ \t]*```bash[^\n]*\n(.*?)\n[ \t]*```[ \t]*$", re.DOTALL | re.MULTILINE)
 FENCED_CODE = re.compile(r"```.*?```|~~~.*?~~~", re.DOTALL)
 INLINE_CODE = re.compile(r"`[^`\n]*`")
+# Trailing punctuation that prose glues onto a token: quotes/brackets that wrap
+# a quoted command span (`'cli cmd --flag'`) and sentence punctuation. Cobra
+# flag names are `[a-z0-9-]`, so trimming these can never truncate a real name.
+TOKEN_TRAILING_PUNCT = "'\")].,;:"
 SHELL_VAR_RE = re.compile(r"\$(?:\{[^}\n]+\}|[A-Za-z_][A-Za-z0-9_]*|[0-9]+|[@*#?])")
 COMMAND_REFERENCE_SECTION_RE = re.compile(
     r"^##\s+Command\s+Reference\s*$(.*?)(?=^##\s+|\Z)",
@@ -87,15 +91,19 @@ USE_RE = re.compile(r'Use:\s*"([^"]+)"')
 ARGS_RE = re.compile(
     r'Args:\s*cobra\.(ExactArgs|MinimumNArgs|MaximumNArgs|RangeArgs|NoArgs|OnlyValidArgs|ExactValidArgs)\s*\(([^)]*)\)'
 )
-FLAG_DECL_RE = re.compile(
-    r'(Persistent)?Flags\(\)\.'
-    r'(StringVar|BoolVar|IntVar|Int32Var|Int64Var|Float32Var|Float64Var|DurationVar|'
+FLAG_METHOD_PATTERN = (
+    r'StringVar|BoolVar|IntVar|Int32Var|Int64Var|Float32Var|Float64Var|DurationVar|'
     r'StringSliceVar|StringArrayVar|IntSliceVar|Int32SliceVar|Int64SliceVar|'
     r'Float64SliceVar|BoolSliceVar|DurationSliceVar|'
     r'UintVar|Uint32Var|Uint64Var|UintSliceVar|IPVar|IPSliceVar|Float32SliceVar|'
-    r'StringToStringVar|StringToIntVar|StringToInt64Var)P?\('
+    r'StringToStringVar|StringToIntVar|StringToInt64Var'
+)
+FLAG_DECL_RE = re.compile(
+    r'(Persistent)?Flags\(\)\.'
+    r'(' + FLAG_METHOD_PATTERN + r')P?\('
     r'&[^,]+,\s*"([a-z][a-z0-9-]*)"'
 )
+FLAG_ALIAS_RE = re.compile(r'\b([A-Za-z_]\w*)\s*(?::=|=)\s*[A-Za-z_][\w.]*\.(Persistent)?Flags\(\)')
 @dataclass
 class Finding:
     check: str
@@ -161,6 +169,14 @@ CONSTRUCTOR_RE = re.compile(
 )
 ADDCMD_CHILD_RE = re.compile(r'\.AddCommand\s*\(\s*(new[A-Z]\w*Cmd)\s*\(')
 ROOT_ADDCMD_RE = re.compile(r'rootCmd\.AddCommand\s*\(\s*(new[A-Z]\w*Cmd)\s*\(')
+LOCAL_COMMAND_RE = re.compile(r'(?m)^\s*(\w+)\s*:=\s*&cobra\.Command\s*\{')
+RETURN_VARIABLE_RE = re.compile(r'(?m)^\s*return\s+(\w+)\s*$')
+VARIABLE_ADDCMD_RE = re.compile(r'\b(\w+)\.AddCommand\s*\(([^)]*)\)')
+CONSTRUCTOR_VARIABLE_RE = re.compile(r'\b(\w+)\s*:=\s*(new[A-Z]\w*Cmd)\s*\(')
+FIND_ATTACHMENT_RE = re.compile(
+    r'if\s+(\w+),\s*_,\s*(\w+)\s*:=\s*rootCmd\.Find\(\[\]string\{'
+    r'((?:\s*"[a-z][a-z0-9-]*"\s*,?)+)\}\);\s*\2\s*==\s*nil[^{}]*\{'
+)
 
 
 def _extract_function_body(text: str, start_offset: int) -> str | None:
@@ -221,6 +237,61 @@ def _extract_function_body(text: str, start_offset: int) -> str | None:
     return text[start_offset:i - 1]
 
 
+def _inline_command_children(
+    body: str,
+    fn_name: str,
+    go_file: Path,
+) -> tuple[list[str], dict[str, "CommandConstructor"]]:
+    """Collect local cobra.Command variables attached to a constructor's
+    returned parent variable.
+
+    Generated-then-curated CLIs sometimes build children inline and call
+    `cmd.AddCommand(child)` instead of using a `newChildCmd` constructor. Those
+    are real Cobra edges and must participate in command-path resolution; a
+    same-file `Use:` declaration without that edge must not.
+    """
+    variables: dict[str, tuple[str, tuple | None]] = {}
+    for match in LOCAL_COMMAND_RE.finditer(body):
+        command_body = _extract_function_body(body, match.end())
+        if command_body is None:
+            continue
+        use_match = USE_RE.search(command_body)
+        if use_match is None:
+            continue
+        args_match = ARGS_RE.search(command_body)
+        args_info = (args_match.group(1), args_match.group(2)) if args_match else None
+        variables[match.group(1)] = (use_match.group(1), args_info)
+
+    returned = [match.group(1) for match in RETURN_VARIABLE_RE.finditer(body)]
+    parent_variable = next((name for name in reversed(returned) if name in variables), None)
+    if parent_variable is None:
+        return [], {}
+
+    child_names: list[str] = []
+    children: dict[str, CommandConstructor] = {}
+    for match in VARIABLE_ADDCMD_RE.finditer(body):
+        receiver, arguments = match.groups()
+        if receiver != parent_variable:
+            continue
+        for raw_argument in arguments.split(","):
+            child_variable = raw_argument.strip()
+            if child_variable not in variables:
+                continue
+            use, args_info = variables[child_variable]
+            synthetic_name = f"{fn_name}__inline__{child_variable}"
+            if synthetic_name in children:
+                continue
+            child_names.append(synthetic_name)
+            children[synthetic_name] = CommandConstructor(
+                name=synthetic_name,
+                file=go_file,
+                use=use,
+                args_info=args_info,
+                children=[],
+            )
+    return child_names, children
+
+
 @dataclass
 class CommandConstructor:
     name: str
@@ -228,6 +299,23 @@ class CommandConstructor:
     use: str
     args_info: tuple | None
     children: list[str] = field(default_factory=list)
+    body: str = ""
+
+
+def cli_source_dir(cli_dir: Path) -> Path | None:
+    """Return the directory containing the shipped Cobra command sources.
+
+    Most catalog entries keep source at internal/cli. A small number of entries
+    may keep the public catalog files at the parent while the installable Go
+    module lives in a nested directory to avoid Go module path constraints.
+    """
+    direct = cli_dir / "internal/cli"
+    if direct.exists():
+        return direct
+    nested = sorted(path for path in cli_dir.glob("*/internal/cli") if path.is_dir())
+    if len(nested) == 1:
+        return nested[0]
+    return None
 
 
 @lru_cache(maxsize=None)
@@ -245,8 +333,8 @@ def collect_command_constructors(cli_dir: Path) -> dict[str, CommandConstructor]
     file-system scan only needs to happen once. Callers must not
     mutate the returned dict (it's the cache's storage).
     """
-    src = cli_dir / "internal/cli"
-    if not src.exists():
+    src = cli_source_dir(cli_dir)
+    if not src:
         return {}
     constructors: dict[str, CommandConstructor] = {}
     for go_file in src.glob("*.go"):
@@ -269,13 +357,52 @@ def collect_command_constructors(cli_dir: Path) -> dict[str, CommandConstructor]
             children = list(dict.fromkeys(
                 child.group(1) for child in ADDCMD_CHILD_RE.finditer(body)
             ))
+            returned = RETURN_VARIABLE_RE.findall(body)
+            parent = returned[-1] if returned else None
+            for attachment in VARIABLE_ADDCMD_RE.finditer(body):
+                receiver, arguments = attachment.groups()
+                if receiver != parent:
+                    continue
+                variables = [argument.strip() for argument in arguments.split(",")
+                             if re.fullmatch(r"\w+", argument.strip())]
+                if not variables:
+                    continue
+                # Use the most recent binding before each attachment. Separate
+                # blocks can reuse `sub` for different constructor results.
+                bindings = dict(CONSTRUCTOR_VARIABLE_RE.findall(body[:attachment.start()]))
+                for variable in variables:
+                    child = bindings.get(variable)
+                    if child and child not in children:
+                        children.append(child)
+            inline_names, inline_children = _inline_command_children(body, fn_name, go_file)
+            children.extend(name for name in inline_names if name not in children)
             constructors[fn_name] = CommandConstructor(
                 name=fn_name,
                 file=go_file,
                 use=use_match.group(1),
                 args_info=args_info,
                 children=children,
+                body=body,
             )
+            constructors.update(inline_children)
+    # Curated CLIs may attach a child to a literal path in the built root tree.
+    # Require an actual successful Find guard and an AddCommand on its result;
+    # a matching leaf declaration alone must never establish an edge.
+    roots = find_root_children(cli_dir)
+    for go_file in src.glob("*.go"):
+        if go_file.name.endswith("_test.go"):
+            continue
+        text = read_utf8(go_file)
+        for attachment in FIND_ATTACHMENT_RE.finditer(text):
+            receiver, _, path_literal = attachment.groups()
+            parent = _command_constructor(re.findall(r'"([^"]+)"', path_literal), constructors, roots)
+            body = _extract_function_body(text, attachment.end())
+            if parent is None or body is None:
+                continue
+            child_re = re.compile(r'\b' + re.escape(receiver) + r'\.AddCommand\s*\(\s*(new[A-Z]\w*Cmd)\s*\(')
+            for child in child_re.findall(body):
+                if child in constructors and child not in parent.children:
+                    parent.children.append(child)
     return constructors
 
 
@@ -287,8 +414,8 @@ def find_root_children(cli_dir: Path) -> list[str]:
 
     Cached per cli_dir; callers must not mutate the returned list.
     See collect_command_constructors for rationale."""
-    src = cli_dir / "internal/cli"
-    if not src.exists():
+    src = cli_source_dir(cli_dir)
+    if not src:
         return []
     seen: dict[str, None] = {}
     for go_file in src.glob("*.go"):
@@ -327,6 +454,15 @@ def resolve_command_path(
     if not constructors or not root_children:
         return None, None, None
 
+    current = _command_constructor(cmd_path, constructors, root_children)
+    if current is None:
+        return None, None, None
+    return current.file, current.use, current.args_info
+
+
+def _command_constructor(cmd_path, constructors, root_children):
+    if not cmd_path:
+        return None
     current = None
     for fn_name in root_children:
         info = constructors.get(fn_name)
@@ -337,7 +473,7 @@ def resolve_command_path(
             current = info
             break
     if current is None:
-        return None, None, None
+        return None
 
     for token in cmd_path[1:]:
         next_info = None
@@ -350,10 +486,10 @@ def resolve_command_path(
                 next_info = child
                 break
         if next_info is None:
-            return None, None, None
+            return None
         current = next_info
 
-    return current.file, current.use, current.args_info
+    return current
 
 
 def find_command_source(cli_dir: Path, cmd_path: list[str]):
@@ -398,8 +534,8 @@ def _legacy_find_command_source(cli_dir: Path, cmd_path: list[str]):
     expects (e.g., commands constructed via local helpers, or files that
     declare cobra.Commands without going through a `newXxxCmd` factory)."""
     leaf = cmd_path[-1]
-    src = cli_dir / "internal/cli"
-    if not src.exists():
+    src = cli_source_dir(cli_dir)
+    if not src:
         return [], None, None
 
     candidates = []
@@ -437,14 +573,112 @@ def _legacy_find_command_source(cli_dir: Path, cmd_path: list[str]):
     return top_files, candidates[0][2], candidates[0][3]
 
 
+def iter_flag_declarations(text: str) -> Iterable[tuple[bool, str]]:
+    for m in FLAG_DECL_RE.finditer(text):
+        persistent, _, name = m.groups()
+        yield persistent == "Persistent", name
+
+    aliases = {
+        m.group(1): m.group(2) == "Persistent"
+        for m in FLAG_ALIAS_RE.finditer(text)
+    }
+    if not aliases:
+        return
+
+    alias_decl_re = re.compile(
+        r'\b(' + "|".join(re.escape(alias) for alias in aliases) + r')\.'
+        r'(' + FLAG_METHOD_PATTERN + r')P?\('
+        r'&[^,]+,\s*"([a-z][a-z0-9-]*)"'
+    )
+    for m in alias_decl_re.finditer(text):
+        yield aliases[m.group(1)], m.group(3)
+
+
+def _iter_bool_flag_names(text: str) -> Iterable[str]:
+    """Long-names of boolean flags declared in text (BoolVar/BoolVarP and the
+    alias-receiver form). Mirrors iter_flag_declarations' direct + alias scan but
+    keeps only the boolean methods, so the recipe tokenizer can tell a value-less
+    boolean flag (`--json <positional>`) from a value-bearing one
+    (`--filter <value>`)."""
+    for m in FLAG_DECL_RE.finditer(text):
+        _persistent, method, name = m.groups()
+        if method in ("BoolVar", "BoolSliceVar"):
+            yield name
+
+    # Non-Var Cobra boolean declarations have a different argument shape:
+    # Flags().Bool("json", false, ...) / BoolP("json", "j", false, ...).
+    for m in re.finditer(
+        r'(?:Persistent)?Flags\(\)\.BoolP?\(\s*"([a-z][a-z0-9-]*)"',
+        text,
+    ):
+        yield m.group(1)
+
+    aliases = {
+        m.group(1): m.group(2) == "Persistent"
+        for m in FLAG_ALIAS_RE.finditer(text)
+    }
+    if not aliases:
+        return
+
+    alias_decl_re = re.compile(
+        r'\b(' + "|".join(re.escape(alias) for alias in aliases) + r')\.'
+        r'(' + FLAG_METHOD_PATTERN + r')P?\('
+        r'&[^,]+,\s*"([a-z][a-z0-9-]*)"'
+    )
+    for m in alias_decl_re.finditer(text):
+        if m.group(2) in ("BoolVar", "BoolSliceVar"):
+            yield m.group(3)
+
+
+@lru_cache(maxsize=None)
+def _boolean_flag_names(cli_dir: Path) -> frozenset[str]:
+    """Long-names of every boolean flag declared in the CLI's internal/cli/*.go
+    (cached per cli_dir). The recipe tokenizer consults this so it never consumes
+    the token after a value-less boolean flag as that flag's value — doing so
+    would silently drop a real positional. A CLI-wide scan (rather than
+    per-command) deliberately includes persistent/root booleans like --json or
+    --verbose, which are the common case a recipe writes before a positional."""
+    cli_pkg = cli_source_dir(cli_dir)
+    if cli_pkg is None:
+        return frozenset()
+    names: set[str] = set()
+    for path in sorted(cli_pkg.glob("*.go")):
+        try:
+            text = read_utf8(path)
+        except Exception:
+            continue
+        names.update(_iter_bool_flag_names(text))
+    return frozenset(names)
+
+
+@lru_cache(maxsize=None)
+def _command_boolean_flag_names(cli_dir: Path, cmd_path: tuple[str, ...]) -> frozenset[str]:
+    """Honor local flag types over same-named flags on other commands."""
+    constructors = collect_command_constructors(cli_dir)
+    roots = find_root_children(cli_dir)
+    command = _command_constructor(list(cmd_path), constructors, roots)
+    if command is None or not command.body:
+        return _boolean_flag_names(cli_dir)
+    # Retain the legacy discovery of inherited booleans, then override with
+    # the declaring constructor, not every sibling in the same source file.
+    names = set(_boolean_flag_names(cli_dir))
+    for match in FLAG_DECL_RE.finditer(command.body):
+        _, method, name = match.groups()
+        if method == "BoolVar":
+            names.add(name)
+        else:
+            names.discard(name)
+    return frozenset(names)
+
+
 def flag_declared_in(files: Iterable[Path], flag_name: str) -> bool:
     for f in files:
         try:
             text = read_utf8(f)
         except Exception:
             continue
-        for m in FLAG_DECL_RE.finditer(text):
-            if m.group(3) == flag_name:
+        for _, name in iter_flag_declarations(text):
+            if name == flag_name:
                 return True
     return False
 
@@ -562,8 +796,8 @@ def flag_declared_via_helper(cli_dir: Path, cmd_files: Iterable[Path], flag_name
     if not helper_names:
         return False
 
-    src = cli_dir / "internal/cli"
-    if not src.exists():
+    src = cli_source_dir(cli_dir)
+    if not src:
         return False
 
     func_re = re.compile(
@@ -580,24 +814,23 @@ def flag_declared_via_helper(cli_dir: Path, cmd_files: Iterable[Path], flag_name
             continue
         for m in func_re.finditer(text):
             body = go_block_body(text, m.end() - 1)
-            for fm in FLAG_DECL_RE.finditer(body):
-                if fm.group(3) == flag_name:
+            for _, name in iter_flag_declarations(body):
+                if name == flag_name:
                     return True
     return False
 
 
 def persistent_flag_declared(cli_dir: Path, flag_name: str) -> bool:
-    src = cli_dir / "internal/cli"
-    if not src.exists():
+    src = cli_source_dir(cli_dir)
+    if not src:
         return False
     for go_file in src.glob("*.go"):
         try:
             text = read_utf8(go_file)
         except Exception:
             continue
-        for m in FLAG_DECL_RE.finditer(text):
-            persistent, _, name = m.groups()
-            if name == flag_name and persistent == "Persistent":
+        for persistent, name in iter_flag_declarations(text):
+            if name == flag_name and persistent:
                 return True
     return False
 
@@ -630,13 +863,26 @@ def _cli_invocation_from_tokens(
         ):
             break
         if len(cmd_path) < 3 and re.match(r"^[a-z][a-z0-9-]*$", t):
-            # Verify adding this token still maps to a valid command. If the
-            # extended path has no source match, this token is an argument.
             if cli_dir is not None:
                 trial = cmd_path + [t]
-                files, _, _ = find_command_source(cli_dir, trial)
-                if not files:
-                    break
+                child_file, _, _ = resolve_command_path(cli_dir, trial)
+                if child_file is not None:
+                    cmd_path.append(t)
+                    i += 1
+                    continue
+                # Preserve wholly legacy command trees whose parent is not in
+                # the constructor graph. Graph-resolved parents include local
+                # variable-wired children collected by
+                # _inline_command_children, so they never need a file-proximity
+                # heuristic that could promote an unwired sibling.
+                current_file, _, _ = resolve_command_path(cli_dir, cmd_path)
+                if current_file is None:
+                    child_files, _, _ = find_command_source(cli_dir, trial)
+                    if child_files:
+                        cmd_path.append(t)
+                        i += 1
+                        continue
+                break
             cmd_path.append(t)
             i += 1
             continue
@@ -647,14 +893,27 @@ def _cli_invocation_from_tokens(
     while i < len(tokens):
         t = tokens[i]
         if t == "--":
-            i += 1
-            continue
+            positional.extend(tokens[i + 1:])
+            break
         if t.startswith("--"):
-            flags.append(t.split("=", 1)[0])
-            # Skip a space-separated value (`--flag value`), but NOT when the
-            # value is inline (`--flag=value`) — there the next token is a
-            # positional, not this flag's value.
-            if "=" not in t and i + 1 < len(tokens) and not tokens[i + 1].startswith("-"):
+            flag_name = t.split("=", 1)[0].rstrip(TOKEN_TRAILING_PUNCT)
+            flags.append(flag_name)
+            # Skip a space-separated value (`--flag value`), but NOT when:
+            #  - the value is inline (`--flag=value`) — the next token is a
+            #    positional, not this flag's value; or
+            #  - the flag is a known boolean flag, which takes no value, so the
+            #    next token is a positional (consuming it would under-count the
+            #    recipe's positional args).
+            is_bool = (
+                cli_dir is not None
+                and flag_name.lstrip("-") in _command_boolean_flag_names(cli_dir, tuple(cmd_path))
+            )
+            if (
+                "=" not in t
+                and not is_bool
+                and i + 1 < len(tokens)
+                and not tokens[i + 1].startswith("-")
+            ):
                 i += 2
                 continue
         elif t.startswith("-"):
@@ -717,6 +976,48 @@ def _split_before_shell_operator(line: str) -> str:
     return line
 
 
+def _strip_trailing_shell_comment(line: str) -> str:
+    quote: str | None = None
+    escaped = False
+    i = 0
+    while i < len(line):
+        ch = line[i]
+        if quote == "'":
+            if ch == "'":
+                quote = None
+            i += 1
+            continue
+        if quote == '"':
+            if escaped:
+                escaped = False
+                i += 1
+                continue
+            if ch == "\\":
+                escaped = True
+                i += 1
+                continue
+            if ch == quote:
+                quote = None
+            i += 1
+            continue
+        if escaped:
+            escaped = False
+            i += 1
+            continue
+        if ch == "\\":
+            escaped = True
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            i += 1
+            continue
+        if ch == "#" and (i == 0 or line[i - 1].isspace()):
+            return line[:i].rstrip()
+        i += 1
+    return line
+
+
 def _shell_operator_cut_index(line: str, operator_index: int) -> int:
     # Redirections may be prefixed by a file descriptor, e.g. `2>err`.
     if line[operator_index] in "><":
@@ -756,7 +1057,15 @@ def _extract_prose_invocations(
                 tokens = shlex.split(fragment, posix=True)
             except ValueError:
                 tokens = fragment.split()
-            tokens = [t.strip(".,;:)") for t in tokens if t.strip(".,;:)")]
+            # Strip wrapping/trailing punctuation, including quotes: a
+            # single-quoted prose command like `'<cli> auth login --chrome'`
+            # whose closing quote shlex.split cannot balance falls back to
+            # `fragment.split()` and would otherwise leak `--chrome'`.
+            tokens = [
+                t.strip(TOKEN_TRAILING_PUNCT)
+                for t in tokens
+                if t.strip(TOKEN_TRAILING_PUNCT)
+            ]
             if len(tokens) < 2:
                 continue
 
@@ -811,10 +1120,7 @@ def extract_cli_invocations(skill: Path, cli_binary: str, cli_dir: Path | None =
             line = line.strip()
             if not line or line.startswith("#"):
                 continue
-            # Strip trailing comment
-            cmt = line.find(" #")
-            if cmt != -1:
-                line = line[:cmt].strip()
+            line = _strip_trailing_shell_comment(line)
             if not line.startswith(cli_binary + " "):
                 continue
             # Strip shell command substitutions $(...) and backtick forms
@@ -928,7 +1234,8 @@ def check_flag_names(cli_dir: Path, sources: list[Path], cli_binary: str, report
     # so users see both surfaces and don't get a false "fixed" signal
     # after editing only the first source. Matches check_flag_commands's
     # per-source emission policy.
-    all_files = list((cli_dir / "internal/cli").glob("*.go"))
+    source_dir = cli_source_dir(cli_dir)
+    all_files = list(source_dir.glob("*.go")) if source_dir else []
     for src in sources:
         seen: set[str] = set()
         for raw_cmd_path, _positional, flags, _surface in extract_cli_invocations(src, cli_binary, cli_dir):
@@ -953,12 +1260,34 @@ def check_flag_names(cli_dir: Path, sources: list[Path], cli_binary: str, report
 
 
 def check_flag_commands(cli_dir: Path, sources: list[Path], cli_binary: str, report: Report) -> None:
-    all_files = list((cli_dir / "internal/cli").glob("*.go"))
+    source_dir = cli_source_dir(cli_dir)
+    all_files = list(source_dir.glob("*.go")) if source_dir else []
     for src in sources:
         seen: set[tuple[str, str]] = set()
         for raw_cmd_path, _positional, flags, _surface in extract_cli_invocations(src, cli_binary, cli_dir):
             cmd_path = list(raw_cmd_path)
             path_str = " ".join(cmd_path)
+            # The extractor under-resolves subcommands whose names contain an
+            # underscore — `messages post_message --text` yields cmd_path
+            # ["messages"] with "post_message" left among the positionals — so
+            # flags belonging to the subcommand were attributed to its parent and
+            # reported as "declared elsewhere but not on <parent>".
+            #
+            # check_positional_args already treats this shape as a false positive
+            # (see the snake_case note there), but that only downgraded its own
+            # finding; this check still emitted hard errors.
+            #
+            # Resolve it instead of suppressing it, but only as a fallback once the
+            # parent has been ruled out. Trying the child first would misread
+            # commands that take a resource name positionally — `export messages
+            # --format` and `tail messages --interval` both resolve
+            # ["export", "messages"] to a messages source file, which does not
+            # declare --format or --interval, turning working docs into errors.
+            fallback_path: list[str] | None = None
+            if len(cmd_path) == 1 and _positional and re.match(r"^[a-z][a-z0-9_-]+$", _positional[0]):
+                candidate = cmd_path + [_positional[0]]
+                if find_command_source(cli_dir, candidate)[0]:
+                    fallback_path = candidate
             for raw_flag in flags:
                 flag = raw_flag.lstrip("-")
                 key = (path_str, flag)
@@ -971,6 +1300,15 @@ def check_flag_commands(cli_dir: Path, sources: list[Path], cli_binary: str, rep
                     continue
                 if cmd_files and flag_declared_via_helper(cli_dir, cmd_files, flag):
                     continue
+                # Parent ruled out — the flag may belong to an under-resolved
+                # subcommand left in the positionals (see fallback_path above).
+                if fallback_path:
+                    sub_files, _, _ = find_command_source(cli_dir, fallback_path)
+                    if sub_files and (
+                        flag_declared_in(sub_files, flag)
+                        or flag_declared_via_helper(cli_dir, sub_files, flag)
+                    ):
+                        continue
                 seen.add(key)
                 if flag_declared_in(all_files, flag):
                     report.findings.append(
@@ -1202,8 +1540,8 @@ def run_checks(cli_dir: Path, only: set[str] | None) -> Report:
     if not skill.exists():
         print(f"error: no SKILL.md in {cli_dir}", file=sys.stderr)
         sys.exit(2)
-    if not (cli_dir / "internal/cli").exists():
-        print(f"error: no internal/cli/ in {cli_dir}", file=sys.stderr)
+    if not cli_source_dir(cli_dir):
+        print(f"error: no internal/cli/ source tree in {cli_dir}", file=sys.stderr)
         sys.exit(2)
 
     cli_binary = derive_cli_binary(cli_dir)
